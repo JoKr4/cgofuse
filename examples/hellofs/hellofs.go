@@ -13,107 +13,110 @@
 package main
 
 import (
-	"fmt"
+	"io"
 	"log"
 	"os"
+	"path/filepath"
 
 	"github.com/winfsp/cgofuse/fuse"
 )
 
-const (
-	filename = "hello"
-	contents = "hello, world\n"
-)
-
 type Hellofs struct {
 	fuse.FileSystemBase
-	content *os.File
-	len     int64
+	files []*os.File
+	names []string
 }
 
 func (self *Hellofs) Open(path string, flags int) (errc int, fh uint64) {
-	switch path {
-	case "/" + filename:
-		return 0, 0
-	default:
-		return -fuse.ENOENT, ^uint64(0)
+
+	for _, n := range self.names {
+		if n == filepath.Base(path) {
+			return 0, 0
+		}
 	}
+
+	return -fuse.ENOENT, ^uint64(0)
 }
 
 func (self *Hellofs) Getattr(path string, stat *fuse.Stat_t, fh uint64) (errc int) {
-	fmt.Println("Getattr", path)
-	switch path {
-	case "/":
+
+	if path == "/" {
 		stat.Mode = fuse.S_IFDIR | 0555
-		//stat.Mode = fuse.S_IFDIR | 0777
 		stat.Gid = 0
 		stat.Uid = 0
 		stat.Size = 4096
 		stat.Nlink = 2
 		return 0
-	case "/" + filename:
-		stat.Mode = fuse.S_IFREG | 0444
-		//stat.Mode = fuse.S_IFREG | 0777
-		//stat.Size = int64(len(contents))
-		stat.Size = self.len
-		stat.Gid = 0
-		stat.Uid = 0
-		stat.Nlink = 1
-		return 0
-	default:
-		return -fuse.ENOENT
 	}
-}
 
-func (self *Hellofs) Chown(path string, uid uint32, gid uint32) int {
-	// fmt.Println(uid, gid)
-	// if uid == 1000 && gid == 1000 {
-	// 	return 0
-	// }
-	return -fuse.ENOSYS
+	for i, n := range self.names {
+		if n == filepath.Base(path) {
+			// https://stackoverflow.com/questions/46558824/how-do-i-get-a-block-devices-size-correctly-in-go
+			pos, err := self.files[i].Seek(0, io.SeekEnd)
+			if err != nil {
+				log.Printf("error seeking to end: %s\n", err)
+				continue
+			}
+			stat.Size = pos
+			stat.Mode = fuse.S_IFREG | 0444
+			stat.Gid = 0
+			stat.Uid = 0
+			stat.Nlink = 1
+			return 0
+		}
+	}
+
+	return -fuse.ENOENT
 }
 
 func (self *Hellofs) Read(path string, buff []byte, ofst int64, fh uint64) (n int) {
-	// endofst := ofst + int64(len(buff))
-	// if endofst > self.len {
-	// 	endofst = self.len
-	// }
-	// if endofst < ofst {
-	// 	return 0
-	// }
-	n, _ = self.content.ReadAt(buff, ofst)
-	return
+	for i, name := range self.names {
+		if name == filepath.Base(path) {
+			n, _ = self.files[i].ReadAt(buff, ofst)
+			return n
+		}
+	}
+	return 0
 }
 
 func (self *Hellofs) Readdir(path string,
 	fill func(name string, stat *fuse.Stat_t, ofst int64) bool,
 	ofst int64,
 	fh uint64) (errc int) {
-	// s := fuse.Stat_t{
-	// 	Uid:  1000,
-	// 	Gid:  1000,
-	// 	Mode: 755,
-	// }
 	fill(".", nil, 0)
 	fill("..", nil, 0)
-	fill(filename, nil, 0)
+	for _, n := range self.names {
+		fill(n, nil, 0)
+	}
 	return 0
 }
 
 func main() {
-	f, err := os.Open("/home/johannes/filme.txt")
-	if err != nil {
-		log.Fatal(err)
-	}
-	s, err := f.Stat()
-	if err != nil {
-		log.Fatal(err)
+
+	mountpoint := "/mnt/optical-drives"
+
+	drives := []string{
+		"/dev/sr0",
+		"/dev/sr1",
 	}
 
 	hellofs := &Hellofs{
-		content: f,
-		len:     s.Size(),
+		files: make([]*os.File, 0, len(drives)),
+		names: make([]string, 0, len(drives)),
 	}
+
+	for _, d := range drives {
+		f, err := os.Open(d)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+		mountAs := filepath.Base(f.Name()) + ".iso"
+		hellofs.files = append(hellofs.files, f)
+		hellofs.names = append(hellofs.names, mountAs)
+		log.Printf("opened '%s' to mount as '%s'", f.Name(), mountAs)
+	}
+
 	host := fuse.NewFileSystemHost(hellofs)
-	host.Mount(os.Args[1], []string{"-o", "ro,allow_other"})
+	host.Mount(mountpoint, []string{"-o", "ro,allow_other"})
 }
